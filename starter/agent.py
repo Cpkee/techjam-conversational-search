@@ -1075,7 +1075,8 @@ class Agent:
         catalog_path: str | Path = "data/catalog.jsonl",
         erasure_mode: str = "accumulate",
         embedding_model: str = "bge",
-        clarify_spread_gate: bool = True,
+        clarify_spread_gate: bool = False,
+        suppress_revise_turn1: bool = False,
         profile_store_path: str | Path = "profiles.json",
     ) -> None:
         if erasure_mode not in ("erase", "accumulate", "gated"):
@@ -1084,12 +1085,21 @@ class Agent:
             raise ValueError('embedding_model must be "bge" or "blair"')
         self.erasure_mode = erasure_mode
         self.embedding_model = embedding_model
-        # Ablation toggle (diagnostic, per CLAUDE.md's PROGRESS LOG Step 8 findings):
-        # when False, CLARIFY asks whenever attr_candidates is non-empty, ignoring
-        # SPREAD entirely -- isolates whether SPREAD-gating itself is net-negative on
-        # this dataset, independent of the info-gain selection logic. Default True
-        # keeps Step 8's normal SPREAD-gated behavior.
+        # Step 9: SPREAD-gating CLARIFY is RESOLVED, not an open ablation any more --
+        # dev_subset (39 sessions, same code otherwise): clarify_spread_gate=True
+        # (SPREAD-gated) scored recommended_technical_score=0.2949 (turns_with_ask=
+        # 122/320, ~38% -- badly under-asking); clarify_spread_gate=False (always-ask
+        # whenever attr_candidates is non-empty) scored 0.6383 (turns_with_ask=250/282,
+        # ~89%). Default is now False permanently. Kept as a constructor parameter
+        # only for reproducing that comparison, not because the question is open.
         self.clarify_spread_gate = clarify_spread_gate
+        # Step 9 MAG/REVISE calibration knob: when True, a turn-1 MAG-floor miss falls
+        # straight through to ranking instead of attempting REVISE. Per CLAUDE.md's
+        # Step 7 finding, turn 1 has almost nothing disclosed yet, so REVISE's strategy
+        # (broadening rewrite->expansion terms) has little to work with there --
+        # candidate for recovering the mttc cost MAG's fix introduced. Default False
+        # (REVISE fires on any turn, including turn 1) until Step 9 picks a winner.
+        self.suppress_revise_turn1 = suppress_revise_turn1
         self.gated_counters = {
             "delete_proposed": 0,
             "delete_downgraded": 0,
@@ -1327,8 +1337,10 @@ class Agent:
         # from `expansion`, so only KW needs re-running) -- then fall through to
         # ranking regardless of whether the revision actually improved anything. MAG
         # gates only this one attempt; it never gates RANKLLM/TOPK below.
+        # suppress_revise_turn1 (Step 9 calibration knob, see __init__): on turn 1
+        # specifically, skip the REVISE attempt even on a MAG-floor miss.
         revised = False
-        if not _mag_ok(fused):
+        if not _mag_ok(fused) and not (self.suppress_revise_turn1 and turn == 1):
             revised = True
             self.mag_counters["revision_triggered"] += 1
             revised_terms = list(dict.fromkeys(_terms(analysis.expansion)))[:40]

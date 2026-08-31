@@ -6,6 +6,7 @@ results.json
 profiles.json
 results_roundtrip_profiles.json
 data/catalog.blair_embeddings.npy
+data/catalog.bge_embeddings.npy
 data/catalog.jsonl
 data/releases/
 # Organizer-only code, private evaluation data, manifests, and build reports.
@@ -19,3 +20,5 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+step9_results/
+/.agents/
