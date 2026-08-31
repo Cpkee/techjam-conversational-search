@@ -32,19 +32,96 @@ mv catalog.jsonl data/catalog.jsonl
 
 Verify the downloaded file using the published `SHA256SUMS` file.
 
-## Run the Starter
+## Local Setup
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+`starter/agent.py` in this repo is no longer the bare BM25 stub — it depends on a
+locally-served LLM (via [Ollama](https://ollama.com)) and a Hugging Face embedding
+model. Set both up before running the evaluator.
+
+### 1. Python dependencies
+
+Python 3.10+ is recommended.
+
+```bash
+pip install pydantic numpy torch transformers
+```
+
+Everything else (`sqlite3`, `urllib`, etc.) is standard library — no vector DB or
+LLM-orchestration framework required.
+
+### 2. Local LLM via Ollama
+
+Install Ollama, then pull and serve the model the agent calls (`qwen3:8b`, see
+`starter/agent.py`'s `OLLAMA_MODEL`):
+
+```bash
+brew install ollama        # or download from https://ollama.com/download
+ollama serve                # starts the local server on http://localhost:11434
+ollama pull qwen3:8b        # in a second terminal, one-time download
+```
+
+`ollama serve` must stay running (or be running as a background service) for the
+whole time you run the evaluator — `agent.py` calls `http://localhost:11434/api/chat`
+directly and silently falls back to a no-op response for any turn where that call
+fails, so a stopped server won't crash a run, it will just quietly tank your score.
+Verify it's up before a real run:
+
+```bash
+curl -s http://localhost:11434/api/tags   # should list qwen3:8b
+```
+
+### 3. Embedding model (dense retrieval / BROWSE)
+
+The dense-retrieval track (`starter/embeddings.py`) uses `BAAI/bge-small-en-v1.5` by
+default (`blair-roberta-base` is available as a documented, non-default alternative —
+see the module docstring and `CLAUDE.md` 2.5 for why BGE won out). The first run
+downloads the model from Hugging Face automatically and then embeds the full 50,000-
+product catalog, caching the result to `data/catalog.bge_embeddings.npy` /
+`data/catalog.bge_embeddings_ids.json`; subsequent runs reuse that cache and skip
+re-embedding. The first run can take a while — let it finish uninterrupted.
+
+If an Apple Silicon Mac is available, embeddings automatically run on `mps`;
+otherwise they fall back to CPU.
+
+## Run the Starter
 
 ```bash
 python3 -m evaluator.local_evaluator
 ```
 
-Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
-The command writes per-session results and aggregate metrics to `results.json`.
+Run from the repo root (it imports `evaluator` and `starter` as packages). Edit
+`starter/agent.py` to implement your system. Do not edit the evaluator or public
+labels when reporting your local score. The command writes per-session results and
+aggregate metrics to `results.json`.
 
-The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
-MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
+The included weak BM25 starter (i.e. `agent.py` before any local edits) scores Hit
+Rate@10 `0.125`, MRR `0.068034`, and MTTC `9.81` on the released public set. See
+`docs/baseline_results.json`.
+
+To run against the smaller 39-session dev subset instead of the full 200-session
+public set (useful for faster local iteration given local LLM inference is the
+bottleneck, not the evaluator):
+
+```bash
+python3 -m evaluator.local_evaluator --dataset data/dev_subset.jsonl --output dev_results.json
+```
+
+### Comparison / calibration scripts
+
+Two paired-bootstrap comparison scripts (used to settle the `erasure_mode` question
+documented in `CLAUDE.md`) are also runnable directly, and follow the same Ollama/
+embedding-model setup above:
+
+```bash
+python3 erase_vs_accumulate_comparison.py          # erase vs. accumulate
+python3 erase_accumulate_gated_comparison.py        # + the "gated" DELETE-validation mode
+```
+
+### Tests
+
+```bash
+python3 -m unittest discover
+```
 
 ## Agent Interface
 

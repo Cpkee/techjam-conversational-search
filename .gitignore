@@ -3,6 +3,9 @@ __pycache__/
 .DS_Store
 .env
 results.json
+profiles.json
+results_roundtrip_profiles.json
+data/catalog.blair_embeddings.npy
 data/catalog.jsonl
 data/releases/
 # Organizer-only code, private evaluation data, manifests, and build reports.
