@@ -22,9 +22,9 @@ already been wrong before. Trust the number.
 | 4 (state / erasure) | ~0.60 (dev_subset) | done — see finding below |
 | 5 (dual-track retrieval) | 0.6017 | done — see finding below |
 | 6 (fusion + `RANKLLM`) | 0.6209 | done |
-| 7 (`MAG`/`SPREAD`/`REVISE`) | 0.6034 (MAG fixed, not yet calibrated) | in progress — see finding below |
-| 8 (real `CLARIFY`) | — | not started |
-| 9 (calibration) | — | not started |
+| 7 (`MAG`/`SPREAD`/`REVISE`) | 0.6034 (MAG fixed, not yet calibrated) | done — calibrated in Step 9 |
+| 8 (real `CLARIFY`) | 0.6383 (dev_subset, SPREAD-gate off + brand-fix, pre-Step-10a) | done — see finding below |
+| 9 (calibration) | 0.596816 (dev_subset, corrected baseline) → 0.671749 (FUSION+MAG calibrated, `GATE` still open) | in progress — see findings below |
 
 **Every step so far has surfaced at least one real bug that reasoning alone did not
 catch.** Budget Steps 8-9 assuming this pattern continues, not assuming a clean run.
@@ -116,6 +116,152 @@ catch.** Budget Steps 8-9 assuming this pattern continues, not assuming a clean 
   read `entry["text"]` and treat both sources identically; nothing branches on `source`
   yet. The round-trip test was re-run after this change and reproduced the exact same
   result (`color`→`material`, same recommendation sets) — confirming the tag is inert.
+- **Step 8 (real `CLARIFY`) is DONE.** Entropy-based `_select_ask_attribute` over
+  `POOL`'s current candidates, gated by `no_preference_signal` exclusions and (at the
+  time) `SPREAD`. Found and fixed a real bug during this build: entropy ranking was
+  picking `brand` first in 28/29 sessions that asked anything, because its catalog
+  signal (`store`) has near-maximal diversity (2.3: 99.4% coverage, almost every
+  product a distinct store) — but `local_evaluator.classify_constraint()` has **no
+  branch that ever returns `"brand"`**, confirmed by extracting every literal in its
+  `return "..."` statements. `ask_attribute="brand"` was therefore a guaranteed
+  content-free turn no matter what the customer knew. Fixed via
+  `CONSTRAINT_ROUTABLE_ATTRIBUTES` (the exhaustive traced-reachable set:
+  `material/color/size/style/budget/use_case/feature`) gating entropy ranking, and
+  `CLARIFY_UNREACHABLE_ATTRIBUTES = {"category", "brand"}` excluding both dead ends
+  (`category` is separately owned by `known_slots`/`CATCMP`, not `CLARIFY`, on its own
+  architectural grounds). Deliberately hardcoded rather than imported live from
+  `evaluator.local_evaluator` — that module is dev-only tooling a real submitted agent
+  can't assume is importable.
+- **SPREAD-gating `CLARIFY` is RESOLVED: gate permanently OFF (`clarify_spread_gate`
+  now defaults to `False`), do not reopen.** Measured on `dev_subset.jsonl` (39
+  sessions), same code otherwise (brand-fix already in): gate ON (the original Step 8
+  design — only ask when the pool looks genuinely flat) scored
+  `hit_rate=0.359/mrr=0.241/technical_score=0.2949`, with only 122/320 turns (~38%)
+  asking anything — badly under-asking. Gate OFF (ask whenever `attr_candidates` is
+  non-empty, ignoring `SPREAD` entirely) scored
+  `hit_rate=0.795/mrr=0.565/technical_score=0.6383`, 250/282 turns (~89%) asking. A
+  >2x swing on `technical_score` from one boolean — this is now closed, matching the
+  same pattern as `erasure_mode`: a plausible-sounding gate that empirically hurts.
+  `SPREAD` itself is still computed and stored every turn (diagnostic value, and
+  `Step 10b`/future work may still read it) — only its use as a `CLARIFY` gate is
+  dead.
+- **Two real bugs found while re-verifying the `0.6383` baseline at the start of Step
+  9 — neither is a rehash of anything above.**
+  1. **Step 10a's personalization seed was folding *bare attribute-name words* into
+     `notable_facts`**, not just genuine values. A profile's `preference_tags` can
+     literally be the string `"material"` or `"fit"` (real values from this dataset,
+     not hypothetical) with no accompanying value — e.g. no fabric named for
+     `"material"`. Seeding these verbatim let the Stage 2 LLM fold the bare word
+     itself into `rewrite`/`expansion` (confirmed directly on `public_0012`: seeding
+     `"material"` alone produced `rewrite="women dresses, material"`), which
+     discriminates nothing since it names the SLOT, not a value for it. **Fixed, but
+     not via a curated word list** (a first pass using a hand-picked "does this sound
+     descriptive" list was explicitly rejected as exactly the kind of dataset-specific
+     judgment call this project avoids) — the final `_BARE_ATTRIBUTE_NAME_TOKENS` is
+     the union of `ALLOWED_ATTRIBUTES`, `SLOT_NAMES`, `CONSTRAINT_ROUTABLE_ATTRIBUTES`,
+     and `_CLASSIFY_CONSTRAINT_NAME_ALIASES = {"fit", "sizing"}` — the last two
+     traced directly to `evaluator.local_evaluator.classify_constraint()`'s own
+     source: its `"style"` branch is
+     `any(word in lowered for word in ("department", "style", "fit", "sleeve", "neck"))`,
+     i.e. the evaluator's own code already treats `"fit"` as interchangeable with
+     `"style"` — the identical relationship 2.1 documents for `"department"`, just
+     one more word in that literal tuple. `"sizing"` gets the same treatment from the
+     `"size"` branch. Verified: `"material"`/`"fit"` excluded, `"polyester"`/`"black"`/
+     `"hiking"`/`"wide"`/`"narrow"`/`"comfort"`/`"durability"` (genuine values and this
+     dataset's other quality-descriptor tags) all still pass through.
+  2. **Applying that fix made the aggregate score go *down*, not up**
+     (`0.627949→0.596816` on `dev_subset.jsonl`, hit_rate 31/39→30/39). Traced directly
+     (controlled A/B, identical code, seed on vs. off, `public_0006`/`public_0081`/
+     `public_0012`): all three showed real, confirmed divergence from the seed, mixed
+     direction (`public_0012` miss→hit, `public_0081` hit→miss). For `public_0081`/
+     `public_0006`, `rewrite`/`expansion` actually *converge* to nearly identical text
+     within 2-3 turns, yet outcomes still diverge by turn 4-8 — the mechanism is a
+     **cascade**, not a sustained different query: turn 1's small difference nudges
+     `CLARIFY`'s `ask_attribute` choice, which changes what the customer discloses
+     next, compounding over the session. **This is a real, inherent characteristic of
+     the profile-seeding mechanism, not a bug to chase further** — flagged as a known
+     limitation of Step 10a for the written submission. A structurally-correct fix
+     does not guarantee a monotonic score improvement on a 39-session sample; it just
+     removes that one bug's effect, whichever direction it happened to net out to —
+     the same lesson Step 7's `MAG` fix already taught once. **`0.596816` (dev_subset)
+     is the correct Step 9 reference baseline** — the `0.6383` figure predates the
+     material/fit fix and Step 10a's interaction with it, and should not be cited as
+     current.
+- **Step 9, parameter 1/3 — FUSION weights: RESOLVED, `FUSION_KW_WEIGHT=0.65` /
+  `FUSION_BROWSE_WEIGHT=0.35`.** Tested twice, because the first pass predated the
+  material/fit fix above and the ranking of configs **completely reversed** once it
+  landed — cited here only as a worked example of why re-measuring after a fix isn't
+  optional: pre-fix, 0.65/0.35 scored *worse* than equal weights
+  (`hit_rate=0.769/technical_score=0.6095` vs. equal-weight's `0.6279`); post-fix, on
+  `dev_subset.jsonl` against the corrected baseline: 0.5/0.5 →
+  `hit_rate=0.7692/mrr=0.4697/technical_score=0.5968`; 0.65/0.35 (KW-favored) →
+  `hit_rate=0.8205/mrr=0.5159/technical_score=0.6389`; 0.35/0.65 (BROWSE-favored) →
+  `hit_rate=0.8205/mrr=0.5078/technical_score=0.6365`. Paired-bootstrap on the
+  designated decision metric (`hit_rate_at_10`/`mrr` only, per this project's own
+  rule that fusion weights shouldn't be tuned against a metric they don't directly
+  target) was **inconclusive for all three pairwise comparisons** at n=39 (every CI
+  included zero) — the two "heavy" variants aren't even distinguishable from each
+  other. The one non-noise signal: KW-heavy's full `technical_score` CI vs. equal
+  weights barely excluded zero (`[+0.0029, +0.0974]`) — weak, and not the specified
+  gating metric, but real and never pointing the other direction. Chosen on that
+  basis (explicit call, not a silent default).
+- **Cross-session file collision corrupted (then was cleanly recovered from) two
+  Step 9 `MAG_FLOOR` calibration runs — a real operational risk for this project's
+  process, not an architecture finding, but worth recording so it isn't repeated.**
+  A second, independent Claude Code session was concurrently developing Step 10b
+  (`POLICYSTATS`/`STRATEGY`/`REALIGN`) directly inside `starter/agent.py`,
+  uncommitted, and wired its `REALIGN` gate straight into the shared `respond()`
+  `CLARIFY` logic (a per-session question cap as low as 1 under its
+  `clarify_sparing` strategy). Two `MAG_FLOOR`/`REVISE` calibration runs
+  (`MAG_FLOOR=0.5` alone, and `suppress_revise_turn1` alone — two unrelated levers)
+  both silently ran against this and collapsed to `~0.25-0.27`, nearly identically.
+  **Caught because of that similarity, not because anything crashed**: two different
+  parameters producing nearly the same catastrophic number is a tell that a third,
+  shared factor is actually driving the result. Root cause, confirmed directly by
+  the other session: its bandit's strategy-picker used a fixed `random.Random(0)`
+  seed, so every fresh `Agent()` (exactly what a calibration script creates per
+  config) got an *identical* deterministic strategy sequence regardless of which
+  `MAG_FLOOR`/`REVISE` value was under test, and its two strategies' placeholder
+  warm-start values differed by under 3% — fragile enough that the bandit kept
+  locking onto the 1-question-cap strategy either way. **Fix for the rest of the
+  session**: built an isolated copy of `starter/`/`evaluator/` pinned to the last
+  clean commit plus only this project's own verified Step 9 fixes, symlinked to the
+  shared (read-only, low-risk) `data/` directory, and ran all subsequent Step 9
+  calibration from there — fully decoupled from whatever either session edits in the
+  live working directory. Re-running the identical two configs from the clean copy
+  flipped both from catastrophic collapse to the best scores measured in the whole
+  calibration (see below) — confirming the contamination diagnosis directly, not
+  just plausibly. **Process takeaway for future work on this repo: check
+  `git status`/`git diff` on shared files before trusting a surprising calibration
+  result, especially if multiple sessions might be active** — this cost two ~30-40
+  minute runs before being caught.
+- **Step 9, parameter 2/3 — `MAG_FLOOR`/`REVISE`: RESOLVED, `MAG_FLOOR=0.5`,
+  `suppress_revise_turn1` stays `False`.** All numbers below are from the isolated,
+  contamination-free re-run (see above), on top of the now-locked `FUSION_KW_WEIGHT
+  =0.65`. Baseline (`floor=0.3`, no suppression) = `hit_rate=0.8205/mrr=0.5159/
+  technical_score=0.6389`. `floor=0.5` alone → `0.8462/0.5520/0.6717`.
+  `suppress_revise_turn1` alone (`floor` stays `0.3`) → `0.8205/0.5496/0.6562`.
+  `floor=0.5` + suppression combined → `0.8462/0.5513/0.6710`. All three beat
+  baseline on every point estimate, but none individually cleared a 95% CI excluding
+  zero at n=39 against baseline. **The one comparison that WAS conclusive**:
+  `floor=0.5` alone vs. the combined config are statistically indistinguishable from
+  each other (`diff=+0.0007`, CI `[-0.0160, +0.0182]`) — turn-1 `REVISE` suppression
+  adds no measurable benefit once the floor is already raised, so it isn't worth the
+  extra parameter. Chose `floor=0.5` alone: best point estimate, CI closest to
+  significance (`[-0.0060, +0.0931]`), no evidence the simpler default costs
+  anything. **This reverses Step 7's own finding that `REVISE` was net-negative** —
+  that conclusion was measured under different conditions (equal `FUSION` weights,
+  the seeding bug still present); these parameters interact, they don't each have one
+  fixed correct value measured in isolation. `suppress_revise_turn1` stays available
+  as a constructor param (default `False`) in case a different combination at full
+  200-session scale reopens the question.
+- **Step 9, parameter 3/3 — `GATE_CONFIDENCE_THRESHOLD`: DEFERRED, kept at the
+  original `0.75` placeholder.** A `threshold=0.6` test was launched (against the
+  now-locked `FUSION_KW_WEIGHT=0.65`/`MAG_FLOOR=0.5`) but stopped before completion
+  and never compared — an explicit, time-constrained call, not a finding. **`0.75` is
+  untested by Step 9, not confirmed-good by it** — this is real remaining calibration
+  work, not a closed question, if time allows a return to it. Do not read the current
+  default as validated the way `FUSION`/`MAG_FLOOR` are.
 
 ---
 
@@ -332,47 +478,66 @@ mark N `# TUNE`), `FUSION` (equal weights, mark `# TUNE`), `RANKLLM` (Ollama cal
 keyword+category+vector scores into the final top-10) all built and measured — improved
 every metric with no regressions (0.6017 → 0.6209).
 
-**Step 7 — Magnitude, spread, revise — always rank regardless. IN PROGRESS, see
-PROGRESS LOG.** `MAG` shipped structurally broken (per-track min-max normalization made
-it unable to ever fire on anything short of a total blank), then fixed via fixed-reference
-normalization — confirmed genuinely discriminating between weak and strong results now.
-Ranking still correctly runs unconditionally regardless of `MAG`'s outcome — that
-constraint has held throughout. **What's still open: `MAG_FLOOR` itself and the `REVISE`
-strategy are real calibration targets for Step 9, not placeholders expected to work once
-picked reasonably** — the current placeholder floor produces a net-negative effect on
-`technical_score`, and turn-1 revisions specifically look unhelpful (see PROGRESS LOG).
-`SPREAD` is computed and stored every turn but deliberately NOT yet wired to any
-behavior — that's Step 8's job, not this one. Do not wire `SPREAD` into `ask_attribute`
-before Step 8; doing so risks reintroducing the exact regression Step 1 fixed.
+**Step 7 — Magnitude, spread, revise — always rank regardless. DONE, calibrated in
+Step 9.** `MAG` shipped structurally broken (per-track min-max normalization made it
+unable to ever fire on anything short of a total blank), then fixed via fixed-reference
+normalization — confirmed genuinely discriminating between weak and strong results.
+Ranking still correctly runs unconditionally regardless of `MAG`'s outcome throughout.
+`MAG_FLOOR` and `REVISE`'s turn-1 behavior were real, open calibration targets exactly
+as flagged here — see Step 9 and the PROGRESS LOG for the resolved values
+(`MAG_FLOOR=0.5`, `suppress_revise_turn1=False`) and why the original "REVISE is
+net-negative" reading of this step turned out to be conditional on FUSION weights that
+Step 9 later changed. `SPREAD` is computed and stored every turn; its use as a
+`CLARIFY` gate was tested in Step 8/9 and resolved OFF (see below) — it is not wired to
+any other behavior currently.
 
-**Step 8 — Real `CLARIFY`.**
-Replace Step 1's placeholder rotation. Candidate set = `ALLOWED_ATTRIBUTES` minus
-known slots minus `asked_attributes`. Pick by information-gain over the current
-`POOL` as the primary signal. Wire `no_preference_signal` from Step 3: hard-exclude
-that attribute immediately; soft-raise the bar for asking anything else this session
-(not an absolute ban). If the candidate set is empty, suppress clarification
-regardless of what `SPREAD` says. Measure — this is where the two MTTC fixes actually
-land structurally.
+**Step 8 — Real `CLARIFY`. DONE — see PROGRESS LOG for full detail.**
+Entropy-based `_select_ask_attribute` over `POOL`'s current candidates replaces Step 1's
+placeholder rotation, gated by `no_preference_signal` exclusions. Found and fixed a real
+bug: entropy ranking was picking `brand` first almost every time because its catalog
+signal (`store`) has near-maximal diversity, but `classify_constraint()` can never
+actually route a match to `"brand"` — a structurally dead attribute regardless of
+calibration. Fixed via `CONSTRAINT_ROUTABLE_ATTRIBUTES`/`CLARIFY_UNREACHABLE_ATTRIBUTES`.
+**SPREAD-gating `CLARIFY` (only ask when the pool looks flat) was tested and is
+RESOLVED OFF, do not reopen** — gated scored `technical_score=0.2949` vs. always-ask's
+`0.6383` on `dev_subset.jsonl`, a >2x swing from one boolean. `clarify_spread_gate`
+defaults to `False` permanently now.
 
-**Step 9 — Calibrate.**
-Named-configuration search first (3-4 options per parameter, not a continuous sweep —
-200 sessions is a small enough sample that fine-grained search risks overfitting to
-dev-set noise), Optuna refinement only if time remains and the first pass shows real
-sensitivity. Order: fusion weights first (isolated, against Hit Rate/MRR only), then
-`MAG`/`SPREAD`/`GATE` together (against full `technical_score`, since they trade Hit
-Rate against MTTC). Every comparison gets the same paired-bootstrap treatment as
-Step 4 — a config "winning" on a point estimate with a CI that includes zero is noise,
-not a finding.
+**Step 9 — Calibrate. IN PROGRESS, see PROGRESS LOG for full detail.**
+Named-configuration search (3-4 options per parameter), paired-bootstrap treatment on
+every comparison — a config "winning" on a point estimate with a CI that includes zero
+is noise, not a finding, and this showed up repeatedly in practice, not just as a
+disclaimer. **Two real bugs were found and fixed before any calibration numbers could
+be trusted**: (1) Step 10a's personalization seed was folding bare attribute-name words
+(`"material"`, `"fit"`) into `notable_facts` as if they were disclosed values — fixed
+via `_BARE_ATTRIBUTE_NAME_TOKENS`, traced to `classify_constraint()`'s own source, not a
+curated list; (2) a second Claude Code session concurrently developing Step 10b inside
+the same `starter/agent.py`, uncommitted, corrupted two `MAG_FLOOR` calibration runs via
+a fixed-seed bandit bug in its own in-progress code — recovered by running the rest of
+Step 9's calibration from an isolated copy of the source pinned to the last clean
+commit. See PROGRESS LOG for both incidents in full, including the exact numbers.
 
-**`MAG_FLOOR` specifically needs real attention here, not a quick pick** — per the
-Step 7 finding, the current placeholder makes `technical_score` net-negative, and 10 of
-38 revision events fired on turn 1 where `REVISE` (broadening `rewrite`→`expansion`
-terms) has little to work with. Test at minimum: a stricter floor (fewer, more
-targeted revisions), and whether suppressing `REVISE` on turn 1 specifically (or using
-a different revision strategy there) recovers the `mttc` cost without losing the `mrr`
-gain the fix already produced. Also re-derive the p10/p90 reference bounds against the
-full 200-session `public_set.jsonl` before finalizing — they were computed against
-`dev_subset.jsonl`'s 39 sessions and should be confirmed, not assumed to transfer.
+**Parameter 1/3, FUSION weights: RESOLVED.** `FUSION_KW_WEIGHT=0.65`/
+`FUSION_BROWSE_WEIGHT=0.35`. Tested twice — the pre-material/fit-fix and post-fix
+rankings of the same three configs completely reversed, which is itself the concrete
+argument for re-measuring after any fix rather than assuming a prior comparison still
+holds. See PROGRESS LOG for full numbers and CIs.
+
+**Parameter 2/3, `MAG_FLOOR`/`REVISE`: RESOLVED.** `MAG_FLOOR=0.5`,
+`suppress_revise_turn1` stays `False` (tested combined with the floor change; added no
+measurable benefit on top of it — the one fully conclusive comparison in this
+parameter's testing). This reverses Step 7's "REVISE is net-negative" finding, measured
+under the old, now-changed FUSION weights — the two parameters interact. Also
+re-derive the `MAG`/`SPREAD` p10/p90 reference bounds against the full 200-session
+`public_set.jsonl` before treating this as final — they were computed against
+`dev_subset.jsonl`'s 39 sessions and have not yet been reconfirmed at full scale.
+
+**Parameter 3/3, `GATE_CONFIDENCE_THRESHOLD`: DEFERRED under time pressure**, kept at
+the original `0.75` placeholder — untested by Step 9, not validated by it. If picking
+this back up: named-config comparison against the now-locked `FUSION_KW_WEIGHT=0.65`/
+`MAG_FLOOR=0.5`, full `technical_score` with buying/browsing scenario breakdowns
+specifically (per this parameter's own scenario-specific design), same paired-bootstrap
+discipline as the other two parameters.
 
 **Step 10 — Pillar III. Only after Step 9 closes. Two halves, in this order, not in
 parallel — 10a before 10b, for a real dependency reason, not just priority.**
@@ -426,6 +591,49 @@ that's a sample-size fact, not evidence the mechanism is broken.
 
 ---
 
+**Step 11 — Dynamic Context Engineering. Proposed, not started. Sequence AFTER Steps
+8-9 close and Step 10b's own pending verification (real warm-start numbers, front/back-
+half validation) lands — do not start this concurrently with either, for the same
+reason Step 10b had to be kept isolated from Step 9: this project's LLM-in-the-loop
+prompt construction is exactly where a small, well-intentioned change silently moves
+`technical_score` (see the Step 10b RNG-seed incident, PROGRESS LOG).**
+
+Unlike Step 10a/10b (structurally inert on `technical_score` — no session shares a
+`user_id`, so cross-session state can't move the number), this DOES touch the live
+single-session `rewrite`/`expansion`/RANKLLM path — so it's a real scoring lever, not
+just rubric credit, and must go through the same paired-bootstrap measurement
+discipline as Step 9, not a "seems obviously better" judgment call.
+
+**Mechanism 1 — Stage 2 prompt construction (`_format_transcript`).**
+`notable_facts` is currently dumped in full, unconditionally; `_recent_content_turns`
+keeps a fixed `RECENT_TURN_WINDOW=2` regardless of relevance to the turn being
+processed. Replace both with relevance-scored selection: rank `notable_facts` by
+lexical overlap with the current message (`_fact_relevance`/`_select_relevant_facts` —
+see chat sketch, not yet in code) and cap at `MAX_FACTS_IN_PROMPT` (`# TUNE`), always
+keeping at least the most recent fact so the line never goes empty. Constraint: this
+call happens INSIDE `_analyze_turn`, BEFORE KW/BROWSE/POOL/MAG/SPREAD run this turn —
+no retrieval-confidence signal is available yet, only the fact text and the current
+message. Do not design this mechanism as if MAG/SPREAD were available here; they
+aren't.
+
+**Mechanism 2 — RANKLLM candidate context (`RANKLLM_CANDIDATE_LIMIT`).**
+Currently a flat top-20 cutoff fed to `_rank_llm`, unconditional every turn. This call
+site runs AFTER `MAG`/`SPREAD` are computed, so — unlike Mechanism 1 — it legitimately
+can use that signal: fewer/terser candidates when the pool is confidently peaked (MAG
+high, SPREAD not flat, POOL's own ranking is probably already close), more when flat
+(RANKLLM has more real work to do disambiguating). Not sketched yet; scope only, same
+as Mechanism 1 was before this write-up.
+
+**Measurement plan**: paired-bootstrap on `hit_rate_at_10`/`mrr`/`mttc` against
+`dev_subset.jsonl` first (fast iteration), full 200-session `public_set.jsonl`
+confirmation before calling either mechanism done — same bar as every other step in
+this file. Expect real risk of a null or negative result, same as MAG_FLOOR's Step 7
+finding — a relevance-scored fact selector is not obviously an improvement over
+"just send everything" until measured; an LLM with irrelevant-but-present context is
+not always worse than one with a smaller, wrongly-filtered context.
+
+---
+
 ## RESOLVED — do not reopen these
 
 - Erase vs. accumulate on intent-override: **`accumulate`, settled.** `CATCMP` never
@@ -433,16 +641,34 @@ that's a sample-size fact, not evidence the mechanism is broken.
 - BLaIR vs. BGE: **`bge-small-en-v1.5`, settled.** BLaIR's hubness survived whitening;
   BGE didn't have the problem at all. Domain-training reasoning was good; empirical
   result went the other way.
+- SPREAD-gating `CLARIFY`: **OFF, permanently, settled.** `clarify_spread_gate` defaults
+  to `False`. Gated scored `technical_score=0.2949`; always-ask scored `0.6383` — a
+  >2x swing. Kept as a constructor param only for reproducing the comparison.
+- FUSION weights: **`FUSION_KW_WEIGHT=0.65`/`FUSION_BROWSE_WEIGHT=0.35`, settled** (Step
+  9, parameter 1/3). See PROGRESS LOG for the full pre/post-fix numbers and CIs.
+- `MAG_FLOOR`/`REVISE`: **`MAG_FLOOR=0.5`, `suppress_revise_turn1=False`, settled**
+  (Step 9, parameter 2/3). Combining suppression with the floor change was tested and
+  conclusively added nothing — don't re-add it without new evidence.
 
 ## OPEN QUESTIONS — build as configurable and report back, do not decide silently
 
-- **`MAG_FLOOR` and the `REVISE` strategy (Step 9)** — the newest and most concrete open
-  item. Current placeholder is net-negative on `technical_score`; turn-1 revisions look
-  specifically unhelpful. See Step 9 and the PROGRESS LOG for what to test.
-- Every other `# TUNE` placeholder from Steps 5-9 (fusion weights, `SPREAD`'s flatness
-  threshold, `GATE`'s confidence threshold, pool top-N) — real unknowns, not values to
-  guess confidently and move on from.
+- **`GATE_CONFIDENCE_THRESHOLD` (Step 9, parameter 3/3)** — the current concrete open
+  item, calibration in progress as of this writing. See Step 9 and the PROGRESS LOG.
+- Every other `# TUNE` placeholder not yet calibrated (pool top-N, `SPREAD`'s flatness
+  threshold — resolved OFF as a `CLARIFY` gate but its threshold value itself is
+  untested) — real unknowns, not values to guess confidently and move on from.
+- The `MAG`/`SPREAD` p10/p90 reference bounds were profiled against `dev_subset.jsonl`
+  (39 sessions) and have not yet been re-derived against the full 200-session
+  `public_set.jsonl` — do the full-200 confirmation run (Step 9's last action) before
+  treating any of Step 9's dev_subset-based choices as final.
 - Whether the private 800-session grading run is one continuous process or parallelized
   across workers — materially changes how much Step 10b's bandit is worth building.
   Reasonable working assumption is "one continuous process," but this is not confirmed —
   ask if there's any channel to check.
+- **New, process-level (not architecture): multiple Claude Code sessions can be
+  concurrently active on this same repo, editing the same files, uncommitted.** This
+  actually happened during Step 9 and corrupted two calibration runs before being
+  caught (see PROGRESS LOG). If picking this project back up with another session
+  potentially active, check `git status`/`git diff` on `starter/agent.py` before
+  trusting a surprising result, and consider working from an isolated copy of the
+  source for any multi-run calibration work rather than the shared working directory.

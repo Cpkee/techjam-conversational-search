@@ -1,0 +1,6 @@
+# Tested versions (Python 3.9). All other imports used by starter/*.py are stdlib
+# (json, re, math, random, sqlite3, urllib, pathlib, typing).
+numpy==2.0.2
+torch==2.8.0
+transformers==4.57.6
+pydantic==2.13.5
